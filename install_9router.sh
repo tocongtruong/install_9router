@@ -28,6 +28,18 @@ UPDATE_SCRIPT="/usr/local/bin/9router-update"
 UPDATE_SERVICE="/etc/systemd/system/9router-update.service"
 UPDATE_TIMER="/etc/systemd/system/9router-update.timer"
 
+# FIX A: Khởi tạo các biến tùy chọn với giá trị mặc định để tránh lỗi 'unbound variable'
+# khi set -u đang bật. Các biến này có thể không được set ở một số access mode.
+INSTALL_SSL="n"
+EMAIL=""
+DOMAIN=""
+CONFIGURE_NGINX="false"
+APP_LISTEN_HOST="0.0.0.0"
+DOCKER_HOST_BIND="0.0.0.0"
+INSTALL_METHOD="docker"
+ACCESS_MODE="direct"
+AUTH_COOKIE_SECURE="false"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -148,6 +160,17 @@ env_file_value() {
   fi
 }
 
+# FIX #1: Password phải luôn là raw value (không có dấu ngoặc kép) ở cả hai mode.
+# Docker --env-file không strip quotes; Node.js dotenv strip quotes chuẩn nhưng
+# nếu app tự đọc file bằng cách khác thì sẽ đọc ra "123456" kèm dấu ngoặc kép.
+# → Ghi password không quote để đảm bảo tương thích mọi trường hợp.
+env_file_value_raw() {
+  local value="$1"
+  value="${value//$'\r'/}"
+  value="${value//$'\n'/}"
+  printf "%s" "$value"
+}
+
 banner() {
   clear 2>/dev/null || true
   printf "%b" "$BOLD$CYAN"
@@ -165,10 +188,10 @@ EOF
 select_install_method() {
   local choice
   while true; do
-    printf "%bInstall method%b\n" "$BOLD" "$NC"
-    printf "  1) Docker image - faster, recommended\n"
-    printf "  2) PM2 source build - builds from GitHub source\n"
-    read -rp "Choose [1]: " choice
+    printf "%bChọn phương thức cài đặt:%b\n" "$BOLD" "$NC"
+    printf "  1) Docker - Khuyên dùng\n"
+    printf "  2) PM2 - Tự build từ source trên máy\n"
+    read -rp "Chọn [1]: " choice
     choice="${choice:-1}"
     case "$choice" in
       1|docker|Docker|DOCKER)
@@ -182,7 +205,7 @@ select_install_method() {
         return 0
         ;;
       *)
-        warn "Invalid choice. Enter 1 or 2."
+        warn "Chọn 1 hoặc 2."
         ;;
     esac
   done
@@ -194,7 +217,7 @@ select_access_mode() {
     printf "\n%bPublic access mode%b\n" "$BOLD" "$NC"
     printf "  1) Nginx reverse proxy + domain + optional SSL\n"
     printf "  2) Existing Caddy/other reverse proxy - script will not touch port 80/443\n"
-    printf "  3) Direct IP:port - no reverse proxy\n"
+    printf "  3) Sử dụng IP:port - Không SSL\n"
     read -rp "Choose [3]: " choice
     choice="${choice:-3}"
     case "$choice" in
@@ -331,6 +354,28 @@ collect_inputs() {
     INIT_PASSWORD="${password_input:-123456}"
   fi
 
+  # FIX #3: Cảnh báo khi data cũ tồn tại.
+  # INITIAL_PASSWORD chỉ được app dùng để seed lần đầu (khi DB chưa có).
+  # Nếu DATA_DIR đã tồn tại với data cũ, password mới sẽ bị bỏ qua hoàn toàn.
+  if [[ -d "${DATA_DIR}" ]] && [[ -n "$(find "${DATA_DIR}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+    printf "\n"
+    warn "Data directory ${DATA_DIR} already exists and is not empty."
+    warn "INITIAL_PASSWORD is only used to seed the database on first run."
+    warn "If you are reinstalling, the existing password will remain unchanged"
+    warn "unless you reset the data directory."
+    printf "\n"
+    local reset_data
+    read -rp "$(printf "%bReset data directory (delete all data and start fresh)?%b (y/n) [n]: " "$BOLD" "$NC")" reset_data
+    reset_data="${reset_data:-n}"
+    if is_yes "$reset_data"; then
+      warn "Deleting ${DATA_DIR}..."
+      rm -rf "${DATA_DIR}"
+      success "Data directory reset. Password '${INIT_PASSWORD}' will be used on first run."
+    else
+      warn "Data kept. Log in with your EXISTING password (the new password setting is ignored)."
+    fi
+  fi
+
   read -rp "$(printf "%bEnable daily auto-update timer?%b (y/n) [n]: " "$BOLD" "$NC")" ENABLE_AUTO_UPDATE
   ENABLE_AUTO_UPDATE="${ENABLE_AUTO_UPDATE:-n}"
 
@@ -374,7 +419,8 @@ install_nodejs() {
 
   step "Installing Node.js ${NODE_MAJOR}"
   curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" -o /tmp/nodesource_setup.sh
-  bash /tmp/nodesource_setup.sh >/dev/null
+  # FIX B: Không suppress stderr của nodesource setup — lỗi GPG/network sẽ ẩn mất nếu redirect /dev/null.
+  bash /tmp/nodesource_setup.sh
   rm -f /tmp/nodesource_setup.sh
   apt-get install -y -qq nodejs
   success "Node.js $(node -v) installed."
@@ -446,7 +492,11 @@ write_env_file() {
   local runtime_data_dir runtime_hostname runtime_port jwt_secret api_key_secret machine_id_salt
 
   install -d -m 0755 "$INSTALL_ROOT"
-  install -d -m 0750 "$DATA_DIR"
+  # FIX C: Chỉ tạo DATA_DIR nếu nó chưa bị xóa bởi user ở bước reset.
+  # Trước đây luôn chạy 'install -d', làm mất tác dụng của việc xóa DATA_DIR ở collect_inputs.
+  if [[ ! -d "$DATA_DIR" ]]; then
+    install -d -m 0750 "$DATA_DIR"
+  fi
 
   if [[ "$INSTALL_METHOD" == "docker" ]]; then
     runtime_data_dir="/app/data"
@@ -469,7 +519,8 @@ write_env_file() {
 # Generated at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 JWT_SECRET=$(env_file_value "$jwt_secret")
-INITIAL_PASSWORD=$(env_file_value "$INIT_PASSWORD")
+# FIX #1: INITIAL_PASSWORD ghi dạng raw (không quote) để app đọc đúng ở mọi mode.
+INITIAL_PASSWORD=$(env_file_value_raw "$INIT_PASSWORD")
 DATA_DIR=$(env_file_value "$runtime_data_dir")
 PORT=${runtime_port}
 HOSTNAME=$(env_file_value "$runtime_hostname")
@@ -510,6 +561,8 @@ install_pm2_mode() {
   info "Building production app..."
   npm run build
 
+  # FIX #4: PM2 ecosystem khai báo env_file để load toàn bộ biến từ .env.
+  # Không khai báo env_file thì JWT_SECRET, INITIAL_PASSWORD, DATA_DIR, etc. sẽ không được load.
   cat > "$PM2_ECOSYSTEM" <<EOF
 module.exports = {
   apps: [{
@@ -517,6 +570,7 @@ module.exports = {
     script: 'npm',
     args: 'start',
     cwd: '${SOURCE_DIR}',
+    env_file: '${SOURCE_DIR}/.env',
     env: {
       NODE_ENV: 'production',
       PORT: ${APP_PORT},
@@ -533,7 +587,8 @@ EOF
   pm2 delete "$APP_NAME" >/dev/null 2>&1 || true
   pm2 start "$PM2_ECOSYSTEM"
   pm2 save
-  pm2 startup systemd -u root --hp /root >/dev/null 2>&1 || warn "PM2 startup registration failed. App is running, but may not auto-start after reboot."
+  # FIX #5: Không redirect stdout của pm2 startup — nó in lệnh cần chạy thủ công trên một số hệ thống.
+  pm2 startup systemd -u root --hp /root 2>/dev/null || warn "PM2 startup registration failed. App is running, but may not auto-start after reboot."
 
   success "9Router is running with PM2 on ${APP_LISTEN_HOST}:${APP_PORT}."
 }
@@ -651,6 +706,9 @@ install_ssl() {
 write_update_script() {
   step "Writing update helper"
 
+  # FIX #7: DOCKER_HOST_BIND có thể chưa được set với PM2 mode.
+  local safe_docker_bind="${DOCKER_HOST_BIND:-0.0.0.0}"
+
   cat > "$UPDATE_SCRIPT" <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -663,23 +721,31 @@ DOCKER_IMAGE="${DOCKER_IMAGE}"
 ENV_FILE="${ENV_FILE}"
 DATA_DIR="${DATA_DIR}"
 APP_PORT="${APP_PORT}"
-DOCKER_HOST_BIND="${DOCKER_HOST_BIND}"
+DOCKER_HOST_BIND="${safe_docker_bind}"
 
+# FIX #8: Thêm hàm err() và trap ERR để hiển thị lỗi rõ ràng khi update thất bại.
 log() { printf '[INFO] %s\\n' "\$1"; }
-ok() { printf '[OK] %s\\n' "\$1"; }
+ok()  { printf '[OK]   %s\\n' "\$1"; }
+err() { printf '[ERR]  %s\\n' "\$1" >&2; }
+
+trap 'rc=\$?; err "Update failed at line \$LINENO (exit \$rc): \$BASH_COMMAND"; exit \$rc' ERR
 
 if [[ "\$METHOD" == "docker" ]]; then
-  log "Pulling \$DOCKER_IMAGE"
+  log "Pulling latest image: \$DOCKER_IMAGE"
   docker pull "\$DOCKER_IMAGE"
 
-  current_image="\$(docker inspect -f '{{.Image}}' "\$APP_NAME" 2>/dev/null || true)"
-  latest_image="\$(docker image inspect -f '{{.Id}}' "\$DOCKER_IMAGE")"
-
-  if [[ -n "\$current_image" && "\$current_image" == "\$latest_image" ]]; then
-    ok "Docker container already uses the latest image."
-    exit 0
+  # So sánh image ID của container đang chạy với image vừa pull.
+  # Nếu giống nhau → không cần restart.
+  if docker inspect "\$APP_NAME" >/dev/null 2>&1; then
+    current_id="\$(docker inspect -f '{{.Image}}' "\$APP_NAME" 2>/dev/null || true)"
+    new_id="\$(docker image inspect -f '{{.Id}}' "\$DOCKER_IMAGE" 2>/dev/null || true)"
+    if [[ -n "\$current_id" && -n "\$new_id" && "\$current_id" == "\$new_id" ]]; then
+      ok "Docker container already uses the latest image. Nothing to do."
+      exit 0
+    fi
   fi
 
+  log "Restarting container with new image..."
   docker rm -f "\$APP_NAME" >/dev/null 2>&1 || true
   docker run -d \\
     --name "\$APP_NAME" \\
@@ -688,24 +754,31 @@ if [[ "\$METHOD" == "docker" ]]; then
     -p "\${DOCKER_HOST_BIND}:\${APP_PORT}:20128" \\
     -v "\${DATA_DIR}:/app/data" \\
     "\$DOCKER_IMAGE"
-  ok "Docker container updated."
+  ok "Docker container updated and restarted."
 else
+  if [[ ! -d "\$SOURCE_DIR/.git" ]]; then
+    err "Source directory \$SOURCE_DIR is not a git repository. Cannot update."
+    exit 1
+  fi
+
   cd "\$SOURCE_DIR"
   old_rev="\$(git rev-parse HEAD)"
+  log "Fetching latest changes from origin/\$REPO_BRANCH..."
   git fetch origin "\$REPO_BRANCH"
   new_rev="\$(git rev-parse "origin/\$REPO_BRANCH")"
 
   if [[ "\$old_rev" == "\$new_rev" ]]; then
-    ok "Source tree is already up to date."
+    ok "Source tree is already up to date (\${old_rev:0:8}). Nothing to do."
     exit 0
   fi
 
+  log "Updating from \${old_rev:0:8} → \${new_rev:0:8}"
   git pull --ff-only origin "\$REPO_BRANCH"
-  npm install
+  npm install --prefer-offline
   npm run build
   pm2 restart "\$APP_NAME" --update-env
   pm2 save
-  ok "PM2 app updated."
+  ok "PM2 app updated to \${new_rev:0:8}."
 fi
 EOF
 
@@ -726,10 +799,19 @@ enable_update_timer() {
   cat > "$UPDATE_SERVICE" <<EOF
 [Unit]
 Description=Update 9Router
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
 ExecStart=${UPDATE_SCRIPT}
+StandardOutput=journal
+StandardError=journal
+
+# FIX D: Thêm [Install] section — thiếu section này thì 'systemctl enable' sẽ báo lỗi
+# "Unit ... has no installation config" và timer sẽ không được kích hoạt đúng cách.
+[Install]
+WantedBy=multi-user.target
 EOF
 
   cat > "$UPDATE_TIMER" <<'EOF'
